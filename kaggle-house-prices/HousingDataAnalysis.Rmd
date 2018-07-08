@@ -1,0 +1,809 @@
+---
+title: "<center><h1>Analysis of Housing Data</h1></center>"
+author: 
+  "<center>Saar Yalov</center>"
+date: "<center>Jan 31st 2018</center>"
+output:
+  pdf_document: default
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+require("rBayesianOptimization")
+require(ggplot2) # for data visualization
+require(mice) # For Data imputation
+require(stringr) #extracting string patterns
+require(Matrix) # matrix transformations
+require(glmnet) # ridge, lasso & elastinet
+require(randomForest)
+require(Metrics) # rmse
+require(dplyr) # load this in last so plyr doens't overlap it
+require(caret) # one hot encoding
+require(scales) # plotting $$
+require(e1071) # skewness
+require(corrplot) # correlation plot
+require(devtools)
+require(lattice)
+install_github('xgboost','tqchen',subdir='R-package')
+```
+
+## R Markdown
+
+
+```{r warning=FALSE, message=FALSE}
+test = read.csv("/Users/saaryalov/Downloads/test (1).csv",stringsAsFactors = F)
+dim(test)
+train = read.csv("/Users/saaryalov/Downloads/train (2).csv",stringsAsFactors = F)
+dim(train)
+full  = bind_rows(train, test)
+str(full)
+full$Id = NULL
+```
+
+## Imputing NA Data
+This data set has lots of missing data. In order to maximize the signal in this data set we need to impute the mising values.
+
+To do so we must recognize the two types of NA's in this data set:
+
+1) Data that is missing not at random: NA's that are there to lack a missing feature in a house (No pool, no basement)
+
+2) Data that is missing at random: For example pool area > 0, but pool quality not specified.
+
+We will handle imputing these different types of missingness differntly. 
+
+If the data is not missing at random, we will manually impute it as fits. That is if there is no pool, we will specify that there is no pool.
+
+However, if the data is not missing at random, manually imputing this data can lead to dangerous changes in our data set. There are specific packages that are aimed at making "unimpactful" imputations to our data set. We will use those (MICE). 
+
+We will first by filling in data that is missing not at random
+
+```{r warning=FALSE, message=FALSE}
+#Define a function for finding NA values
+call.na = function(data){
+  sort(sapply(data, function(x) { sum(is.na(x)) }), decreasing=TRUE)
+}
+call.na(full)
+```
+
+We will start imputing values in decending order:
+
+PoolQC: Pool quality with possible values of:  
+       Ex	Excellent
+       Gd	Good
+       TA	Average/Typical
+       Fa	Fair
+       NA	No Pool
+
+NA is defined for not having a pool. We will change NA to "None" if poo area is 0:
+```{r}
+these = which(is.na(full$PoolQC) & full$PoolArea == 0) 
+full$PoolQC[these] = "None"
+sum(is.na(full$PoolQC))
+```
+So we have only 3 NA values left, these NA values should be missing at random.
+
+MiscFeatures:
+```{r}
+to.none = which(full$MiscVal ==0 & is.na(full$MiscFeature))
+full$MiscFeature[to.none] = "None"
+sum(is.na(full$MiscFeature))
+```
+These values do not seem to be missing at random. Specifically the 1700 MiscVal with NA features. We will either use 
+
+
+Alley and Fence are defined to be None if NA. There are no features which seem to have signal to disprove NA = none. So we will convert NA to none
+
+```{r}
+full$Alley[is.na(full$Alley)] = "None"
+full$Fence[is.na(full$Fence)] = "None"
+```
+
+Salesprice is missing in the Testing set. We will not impute it :)
+
+FireplaceQU: We will compare the the number of fireplaces
+
+```{r}
+which(is.na(full$FireplaceQu) & full$Fireplaces !=0) # No such Fireplaces so we can change all to None
+full$FireplaceQu[is.na(full$FireplaceQu)] = "None"
+```
+
+Lot Frontage is a numeric values with missingness. We will try to "prove" that it is missing at random:
+
+```{r}
+these = which(is.na(full$LotFrontage))
+
+#By Area
+length(unique(full$LotArea[these])) # A lot of values
+range(unique(full$LotArea[these])) # Across a large range of areas
+
+#By zoning
+length(unique(full$MSZoning[these]))
+length(unique(full$MSZoning)) # The same number
+
+# Lot Configuration
+length(unique(full$LotConfig[these]))
+length(unique(full$LotConfig)) # Same number
+
+#By Neighborhood
+length(unique(full$Neighborhood[these]))
+length(unique(full$Neighborhood))
+#Only 2 nbhds with no missing values
+
+#By Buliding Type
+length(unique(full$BldgType[these]))
+length(unique(full$BldgType)) # Same number
+```
+By looking at some features which may be <i>correlated</i> with this missingness, we couldn't find any.
+It is fair to assume the LotFrontage values are missing at random.
+
+
+We will now look at the garage variables (excluding Garage Year Built) that are missing
+```{r}
+these = which(full$GarageArea == 0)
+length(these)
+sum(!is.na(full[these,c("GarageFinish",    "GarageQual",    "GarageCond",    "GarageType")]))
+#Change categoric variables to "None"
+full[these,c( "GarageFinish",    "GarageQual",    "GarageCond",    "GarageType")] = "None" 
+
+
+
+```
+Garage Year Built is a problematic variable.
+
+First lets look at its range:
+
+```{r}
+range(full$GarageYrBlt,na.rm=T)
+sum(full$GarageYrBlt>2010,na.rm=T)
+
+```
+So there is an incorrect value here.
+
+This variable is generally problematic. For now we will remove the NA's with No Garage and call them "No Garage". We will later create a new feature from this variable in the feature engineering section of this Kernel. Meanwhile, think of some ways to do this...
+
+```{r}
+full$GarageYrBlt[these] = "No Garage"
+```
+
+We will start looking at basement variables with missing values
+
+```{r}
+bsmt = c("BsmtCond",  "BsmtExposure", "BsmtQual",  "BsmtFinType2",  "BsmtFinType1","BsmtFullBath",  "BsmtHalfBath", "BsmtFinSF1" ,   "BsmtFinSF2", "BsmtUnfSF",   "TotalBsmtSF" )
+these = which(full$TotalBsmtSF==0)
+length(these)
+for(each in bsmt){
+  if(sapply(full[each], is.numeric) == TRUE){
+    full[these,each] = 0
+  }else{
+    full[these,each] = "None"
+  }
+}
+
+```
+
+The remaining NA values in basment features can be assumed to be missing at random.
+
+We will now impute the Masonry veneer missing value that are not missing at random:
+
+We see that there is at least one value where MasVnrType is NA while MasVnrArea is not NA
+```{r}
+full$MasVnrArea[which(!is.na(full$MasVnrArea) & is.na(full$MasVnrType))]
+hist(full$MasVnrArea) # 198
+#We can assume the one missing NA value in MasVnrType is missing at random and we will impute it as such
+
+#Change all other values to none or zero
+these = which(is.na(full$MasVnrArea))
+full$MasVnrArea[these] = 0
+full$MasVnrType[these] = "None"
+sum(is.na(full$MasVnrArea))
+```
+
+We will assume all other NA values are missing at random, since there are so few in each category.
+
+
+
+# Imputing Randomly Missing Values
+To do this we will use the mice pacakge.
+
+We will first convert all char values to factors:
+
+
+```{r}
+trainToImpute = full[,!(names(full) %in% c("GarageYrBlt","SalePrice"))]
+#missmap(full, col=c('grey', 'steelblue'), y.cex=0.5, x.cex=0.8)
+call.na(trainToImpute) # We are only imputing 4 variables! LotFrontage  BsmtExposure  BsmtFinType2    Electrical
+
+for(col in names(trainToImpute)){
+  if(mode(trainToImpute[,col]) == "character"){
+    trainToImpute[,col] = factor(trainToImpute[,col])
+  }
+}
+fullImputed = mice(trainToImpute, m=1, method='rf', printFlag=FALSE)
+write.csv(fullImputed,file="fullImputed.csv",row.names=FALSE)
+
+```
+
+After imputing our variables, we can seem if they <i>Make sense</i>. We are only imputing 4 variables! LotFrontage  BsmtExposure  BsmtFinType2    Electrical
+
+To do this, we will use the Lattice package which works very well with MICE.
+
+
+Let's start wit the variable with the most imputations- LotFrontage:
+
+In this figure the red dots/lines represnt the imputed values and blue dot/lines represent the non-imputed  values:
+```{r}
+xyplot(fullImputed, LotFrontage ~ LotArea)
+densityplot(fullImputed, ~LotFrontage)
+```
+```{r}
+#densityplot(fullImputed, ~MasVnrArea)
+
+```
+
+
+
+We will compare the remaining to their mode value
+```{r}
+ Mode <- function(x) {
+    ux <- unique(x)
+    ux[which.max(tabulate(match(x, ux)))]
+  }
+
+Mode(trainToImpute$BsmtExposure)
+Mode(full$BsmtExposure)
+Mode(trainToImpute$Electrical)
+Mode(full$Electrical)
+Mode(trainToImpute$BsmtFinType2)
+Mode(full$BsmtFinType2)
+```
+
+The modes are the same.
+
+All of the imputed values are reasonable, we can thus complete imputation. 
+```{r}
+trainCompleted <- complete(fullImputed)
+
+call.na(trainCompleted)
+
+
+
+fullImputed = cbind(full[,(names(full) %in% c("GarageYrBlt","SalePrice"))],trainCompleted)
+
+write.csv(fullImputed,file="fullImputed.csv",row.names=FALSE)
+
+fullJustImputed = fullImputed #For reference
+```
+
+No more missing values! 
+## Feature Engineering and One Hot Encoding##
+
+We will create a new feature that says if the garage is new
+
+??outlier??
+
+## Removing Skewness
+```{r}
+Column_classes <- sapply(names(fullImputed),function(x){class(fullImputed[[x]])})
+numeric_columns <-names(Column_classes[Column_classes != "factor"])
+skew <- sapply(numeric_columns[!numeric_columns %in% c("GarageYrBlt","SalePrice")],function(x){skewness(fullImputed[[x]],na.rm = T)})
+skew <- skew[skew > 0.75]
+for(x in names(skew)) {
+  fullImputed[[x]] <- log(fullImputed[[x]] + 1)
+}
+```
+
+
+New Garage
+```{r}
+#Add check for 
+#fullImputed$GarageYrBlt[which(is.na(fullImputed$NewGarage))]
+fullImputed$NewGarage = as.integer(fullImputed$GarageYrBlt != fullImputed$YearBuilt)
+fullImputed$GarageYrBlt = NULL
+```
+
+Is it buying season?
+```{r}
+hist(fullImputed$MoSold)
+fullImputed$BuyingSeason = (fullImputed$MoSold %in% c(4,5,6))*1
+```
+
+Did the recession effect the market?
+```{r}
+table(fullImputed$YrSold) # Not enough evidence to suggest
+```
+
+Rich Nbhds
+```{r}
+fullImputed$RichNeighborhood = (fullImputed$Neighborhood %in%  c('Crawfor', 'Somerst, Timber', 'StoneBr', 'NoRidge', 'NridgeHt'))*1
+```
+
+Lot Shapes:
+```{r}
+ggplot(data.frame(fullImputed), aes(x=LotShape)) +  geom_bar()+ geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+
+
+fullImputed$RegularLotShape = (fullImputed$LotShape == "Reg")*1
+```
+
+Alley:
+```{r}
+ggplot(data.frame(fullImputed), aes(x=Alley)) +  geom_bar()+ geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+fullImputed$IsAlley = (fullImputed$Alley != "None")*1
+```
+
+LandContour:
+```{r}
+ggplot(data.frame(fullImputed), aes(x=LandContour)) +  geom_bar()+ geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+fullImputed$IsLevel = (fullImputed$LandContour == "Lvl")*1
+```
+
+Utilities
+```{r}
+ggplot(data.frame(fullImputed), aes(x=Utilities)) +  geom_bar()+ geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+fullImputed$Utilities =(fullImputed$Utilities == "AllPub")*1
+```
+
+LotConfig
+```{r}
+ggplot(data.frame(fullImputed), aes(x=LotConfig)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+#High chance of over fitting since there are only few FR3
+fullImputed$LotConfig[fullImputed$LotConfig=="FR3"] = "FR2"
+
+```
+
+
+LandSlope
+```{r}
+ggplot(data.frame(fullImputed), aes(x=LandSlope)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+#High chance of over fitting
+fullImputed$LandSlope = (fullImputed$Utilities != "Gtl")*1
+```
+
+Condition1:
+```{r}
+ggplot(data.frame(fullImputed), aes(x=Condition1)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+```
+Most of these values are saying if one is by a lightrail
+```{r}
+fullImputed$ByArterySt = (fullImputed$Condition1 == "Artery" | fullImputed$Condition2 == "Artery")*1
+fullImputed$ByFeedrSt = (fullImputed$Condition1 == "Feedr" | fullImputed$Condition2 == "Feedr")*1
+fullImputed$ByPositiveFeature = (fullImputed$Condition1 %in% c("PosA","PosN") | trainCompleted$Condition2 %in% c("PosA","PosN"))*1 
+fullImputed$ByTrain = (fullImputed$Condition1 %in% c("RRNn","RRAn","RRNe","RRAe"))
+```
+
+BldgType
+```{r}
+ggplot(data.frame(fullImputed), aes(x=BldgType)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+```
+
+House Style
+```{r}
+ggplot(data.frame(fullImputed), aes(x=HouseStyle)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+median(fullImputed$SalePrice[fullImputed$HouseStyle=="1.5Fin"],na.rm=T)
+median(fullImputed$SalePrice[fullImputed$HouseStyle=="1.5Unf"],na.rm=T)
+```
+We will make a new variable saying unfinished floor
+
+```{r}
+fullImputed$UnfinishedFloor = (fullImputed$HouseStyle %in% c("1.5Unf","2.5Unf"))*1
+fullImputed$SFoyer = (fullImputed$HouseStyle == "SFoyer")*1
+fullImputed$SLvl = (fullImputed$HouseStyle == "SLvl")*1
+```
+
+Year Data Engineering
+```{r}
+ggplot(data.frame(fullImputed), aes(x=YearRemodAdd)) +  geom_bar() + geom_text(aes(label = ..count..), stat='count', vjust=-0.25)
+fullImputed$Remodeled = (fullImputed$YearRemodAdd > fullImputed$YearBuilt)*1
+fullImputed$NewRemodeled = (fullImputed$YearRemodAdd > 2000)*1
+fullImputed$NewHome = (fullImputed$YearBuilt > 2000)*1
+```
+# Treating Outliers 
+We will look at outlier variables in GrLivArea, since it is basically normally distributed, we will remove all values of higher sd then 3
+```{r}
+fullImputedPreOutlier = fullImputed
+train = fullImputed[1:1460,]
+y_train <- log(full$SalePrice[1:1460]+1)
+fullImputed$NewGarage[which(is.na(fullImputed$NewGarage))] = 0 ##### TO FIX
+test = fullImputed[1461:2919,]
+test$SalePrice = NULL
+
+idxtrain = which(train$GrLivArea<mean(train$GrLivArea)-3*sd(train$GrLivArea) | train$GrLivArea>mean(train$GrLivArea)+3*sd(train$GrLivArea))
+#idxtest = which(test$GrLivArea<mean(test$GrLivArea)-3*sd(test$GrLivArea) | test$GrLivArea>mean(test$GrLivArea)+3*sd(test$GrLivArea))
+
+train = train[-idxtrain,]
+#test = test[-idxtest]
+y_train = y_train[-idxtrain]
+
+```
+
+
+Is the house recently remodeled 
+## Model Fitting##
+# Data Preperation
+#Using only XGBOOST
+```{r}
+# full[1:1460,!names(full) %in% c("NewGarage")] = trainCompleted
+#fullImputed$SalePrice[1:1460] = full$SalePrice[1:1460] #Check
+require(xgboost)
+
+sparseMatrix <- sparse.model.matrix(SalePrice ~ .-1, data = train)
+sparseMatrixTest = sparse.model.matrix( ~ .-1, data = test)
+dtrain <- xgb.DMatrix(data = as.matrix(sparseMatrix), label = y_train)
+
+
+cv.ctrl <- trainControl(method = "repeatedcv", repeats = 1,number = 4, 
+                        allowParallel=T)
+xgb.grid <- expand.grid(nrounds = 2500,
+        eta = c(0.01,0.005,0.001),
+        max_depth = c(4,6,8),
+        colsample_bytree=c(0,1,10),
+        min_child_weight = 2,
+        subsample=c(0,0.2,0.4,0.6),
+        gamma=c(0,0.001,0.01, 0.1)
+        )
+set.seed(45)
+# xgb_tune <- train(dtrain,
+#             y_train,
+#             method="xgbTree",
+#             trControl=cv.ctrl,
+#             tuneGrid=xgb.grid,
+#             verbose=T,
+#             metric="RMSE",
+#             nthread =3)
+
+xgb_params_1 <- list( #[1914]	train-rmse:0.013147+0.000114	test-rmse:0.013975+0.000911
+  booster = 'gbtree',
+  objective = 'reg:linear',
+  colsample_bytree=1,
+  eta=0.005,
+  max_depth=4,
+  min_child_weight=2,
+  alpha=0.3,
+  lambda=0.4,
+  gamma=0.01, # less overfit
+  subsample=0.6,
+  seed=5,
+  silent=TRUE)
+xgb_params_2 = list( # [1506]	train-rmse:0.062558+0.001381	test-rmse:0.126363+0.011565
+  booster = 'gbtree',
+  objective = 'reg:linear',
+  colsample_bytree=1,
+  eta=0.01,
+  max_depth=4,
+  min_child_weight=2,
+  alpha=0.3,
+  lambda=0.4,
+  gamma=0.01, # less overfit
+  subsample=0.6,
+  seed=5,
+  silent=TRUE)
+# xgb_params = list(
+#   base_score=0.5, booster='gblinear', colsample_bylevel=1,
+#        colsample_bytree=1, gamma=0, learning_rate=1, max_delta_step=0,
+#        max_depth=3, min_child_weight=1,  n_estimators=1000,
+#        n_jobs=1, nthread=4, nthreads=-1, objective='reg:linear',
+#        random_state=0, reg_alpha=0.09, reg_lambda=1, scale_pos_weight=1, silent=T, subsample=1
+# )
+# xgb_params <- list(
+#   booster = 'gbtree',
+#   objective = 'reg:linear',
+#   max_depth = 10,
+#   colsample_bytree=.4,
+#   eta=0.03,
+#   max_depth=4,
+#   min_child_weight=1,
+#   alpha=0.1,
+#   lambda=0.2,
+#   gamma=0.1, # less overfit
+#   subsample=0.6,
+#   seed=5,
+#   silent=TRUE)
+# xgb_params = list(booster = "gbtree",
+#                  eval_metric = "rmse",
+#                  eta = 0.015625,
+#                  colsample_bytree = 0.2,
+#                  max_depth = 4,
+#                  min_child_weight = 2,
+#                  gamma = 0.0,
+#                  lambda = 1.0,
+#                  subsample = 0.8)
+
+cv = xgb.cv(xgb_params_2, dtrain, nrounds = 2500, nfold = 4, early_stopping_rounds = 10)   #,prediction = T) # Says best stoping is 1500
+# watchlist = list(train=dtrain,test=dtest)
+# e = data.frame(cv$evaluation_log)
+# plot(e$iter,e$train_rmse,col='blue')
+# lines(e$iter,e$test_rmse,col='red')
+
+bst = xgb.train(xgb_params_2,dtrain, nrounds = 1500, early_stopping_rounds = 10,watchlist = list(train=dtrain))
+
+
+xgb.importance(model=bst,feature_names = colnames(dtrain))
+
+
+
+
+test_xgb_yhat <- predict(bst,newdata = sparseMatrixTest,type = "raw")
+xgb_submission <- cbind(Id=1461:2919,SalePrice=exp(test_xgb_yhat)-1)
+write.csv(xgb_submission,file="xgb_sumbission.csv",row.names=FALSE)
+
+# xgb_params_3 <- list(booster="gblinear",
+#               eval_metric="rmse",
+#               eta=0.03125,
+#               lambda = 1.0,
+#               alpha = 0.0,
+#               lambda_bias = 0.0,
+#               min_child_weight = 1,
+#               subsample = 0.8)
+# xgb_params_4 = list(booster="gbtree",
+#               eval_metric="rmse",
+#               eta=0.015625,
+#               colsample_bytree = 0.4,
+#               max_depth = 4,
+#               min_child_weight = 2,
+#               gamma = 0.01,
+#               lambda = 1.0,
+#               subsample = 0.8)
+# cv = xgb.cv(xgb_params_4, dtrain, nrounds = 2500, nfold = 4, early_stopping_rounds = 10)
+
+```
+
+# BART
+```{r}
+require(dbarts)
+brt = bart(as.matrix(sparseMatrix),y_train,x.test=as.matrix(sparseMatrixTest),ntree=1500)
+
+test.brt.salesPrice =  exp(brt$yhat.test.mean)-1
+bart_submission <- cbind(Id=1461:2919,SalePrice=test.brt.salesPrice)
+write.csv(bart_submission,file="bart_submision.csv",row.names=FALSE)
+```
+
+# New BART
+```{r}
+L = 1
+M = 10 # number of trees
+nsweeps = 30
+max_depth = c(1:10+1,rep(50,nsweeps - 10))
+
+Nmin = 50
+alpha = 0.95
+beta = 3
+#tau = diff(range(y))/(M)
+tau = 5*var(y_train)/M
+
+fit = train_forest_2(as.matrix(y_train), as.matrix(sparseMatrix), as.matrix(sparseMatrixTest)[1:1452,], M, L, nsweeps, max_depth, Nmin, alpha = alpha, beta = beta, tau = tau, s= var(y_train), kap = 10, draw_sigma = TRUE, m_update_sigma = FALSE)
+```
+
+
+# Stacking
+We will use 3 different methods and stack them. The idea is that we want methods that are somewhat complementry in their behavior. 
+
+The procedure is as follows:
+1) We split the data into folds
+2) Each algorithm has one testing fold with the remaining folds used for training (Fit 1)
+3) We then fit the prediction of each the folds into another algorithm (Fit 2)
+4) We should like our result, if not go to step 2s
+
+We will use Elastic Net, xgboost, random forests, and support vector regression in Fit 1.
+
+We will then use a Neural Network for Fit 2.
+
+For the first fold we will use elastic net (RMSE - 0.20632 over Kaggle data):
+
+```{r}
+set.seed(1)
+sparseMatrixTrain = sparseMatrix[1:1100,]
+y_train_stack = y_train[1:1100]
+folds = createFolds(1:1100, k = 3)
+foldsTest =unlist(folds[[1]])
+
+sparseMatrixTrain.cv = sparseMatrixTrain[-foldsTest,]
+sparseMatrixTest.cv = sparseMatrixTrain[foldsTest,]
+y_train_cv = y_train_stack[-foldsTest]
+y_test_cv = y_train_stack[foldsTest]
+
+
+train_control= trainControl(method="repeatedcv",
+                                 number=10,
+                                 repeats=5,
+                                 verboseIter=FALSE)
+tuneGrid = expand.grid(alpha= c(seq(.14,.16,.005),1),
+                      lambda=c(seq(0.03,0.1,.005)))
+model_lasso <- train(x=as.matrix(sparseMatrixTrain.cv),y=y_train_cv,
+                    method="glmnet",
+                    metric="RMSE",
+                    maximize=FALSE,
+                    trControl=train_control,
+                    tuneGrid=tuneGrid)
+plot(model_lasso)
+y_pred_enet_cv = as.numeric(predict(model_lasso,sparseMatrixTest.cv)) #alpha = 0.15 and lambda = 0.03.
+RMSE(y_pred_enet_cv,y_test_cv) # 0.1082675
+```
+
+
+Now on the second fold we will fit the xgboost:
+```{r}
+foldsTest =unlist(folds[[2]])
+sparseMatrixTrain.cv = sparseMatrixTrain[-foldsTest,]
+sparseMatrixTest.cv = sparseMatrixTrain[foldsTest,]
+y_train_cv = y_train_stack[-foldsTest]
+y_test_cv = y_train_stack[foldsTest]
+
+cv.ctrl <- trainControl(method = "repeatedcv", repeats = 1,number = 4, 
+                        allowParallel=T)
+xgb.grid <- expand.grid(nrounds = 2500,
+        eta = .01,
+        max_depth = c(4,6,8),
+        subsample = c(0.5, 0.75, 1), 
+        colsample_bytree = c(0.6, 0.8, 1),
+        min_child_weight = 2,
+        gamma=0.01
+        )
+set.seed(45)
+xgb_train = xgb.DMatrix(data = as.matrix(sparseMatrixTrain.cv), label = y_train_cv)
+# xgb_tune <- train(xgb_train,
+#             y_train_cv,
+#             method="xgbTree",
+#             trControl=cv.ctrl,
+#             tuneGrid=xgb.grid,
+#             verbose=T,
+#             metric="RMSE",
+#             alpha=0.3,
+#             lambda=0.4,
+#             nthread =4)
+xgb_params_cv = list(booster="gbtree",
+              eval_metric="rmse",
+              objective = 'reg:linear',
+              eta=0.01,
+              colsample_bytree = .8,
+              max_depth = 4,
+              min_child_weight = 2,
+              gamma = 0.01,
+              alpha=0.3,
+              lambda=0.4,
+              subsample = 0.5)
+
+
+cv = xgb.cv(xgb_params_cv, xgb_train, nrounds = 2500, nfold = 4, early_stopping_rounds = 10)
+bst_xgb_cv = xgb.train(xgb_params_cv,xgb_train, nrounds = 1500, early_stopping_rounds = 10,watchlist = list(train=xgb_train))
+
+xgb.importance(model=bst_xgb_cv,feature_names = colnames(sparseMatrixTrain.cv))
+y_hat_xgb_cv <- predict(bst_xgb_cv,newdata = sparseMatrixTest.cv,type = "raw")
+RMSE(y_hat_xgb_cv,y_test_cv) # 0.1188206
+```
+
+The third fold will be random forest:
+
+```{r}
+# foldsTest =unlist(folds[[3]])
+# sparseMatrixTrain.cv = sparseMatrixTrain[-foldsTest,]
+# sparseMatrixTest.cv = sparseMatrixTrain[foldsTest,]
+# y_train_cv = y_train_stack[-foldsTest]
+# y_test_cv = y_train_stack[foldsTest]
+# 
+# 
+# cv.ctrl <- trainControl(method = "repeatedcv", repeats = 3,number = 4, 
+#                         allowParallel=T)
+# tunegrid <- expand.grid(.mtry=c(1:50))
+# #rf_gridsearch <- train(x=as.matrix(sparseMatrixTrain.cv),y=y_train_cv, method="rf", metric="RMSE",tuneGrid=tunegrid, trControl=cv.ctrl)
+# #rf.train = train(x=as.matrix(sparseMatrixTrain.cv),y=y_train_cv, method="rf", metric="RMSE",mtry=91)
+# tuneRF(as.matrix(sparseMatrixTrain.cv), y_train_cv, stepFactor=1.5, improve=1e-5, ntree=500)
+# rf.fit = randomForest(x=as.matrix(sparseMatrixTrain.cv),y=y_train_cv,metric="RMSE",mtry=91)
+# print(rf_gridsearch)
+# plot(rf_gridsearch)
+# 
+# y_hat_rf = predict(rf.fit,newdata = sparseMatrixTest.cv,type = "raw")
+# RMSE(rf.fit$predicted,y_test_cv) #RMSE 0.08574158
+```
+
+
+After finishing the first fitting process we will continue to the second.
+
+We start by preforming Principle Component Analysis on the response to get an orthogonal vectors
+```{r}
+require(gbm)
+foldsTest =unlist(folds[[3]])
+sparseMatrixTrain.cv = sparseMatrixTrain[-foldsTest,]
+sparseMatrixTest.cv = sparseMatrixTrain[foldsTest,]
+y_train_cv = y_train_stack[-foldsTest]
+y_test_cv = y_train_stack[foldsTest]
+
+set.seed(1)
+tuneGridGBM = expand.grid(n.trees = 700, 
+                       interaction.depth = 5,
+                       shrinkage = 0.05,
+                       n.minobsinnode = 10)
+cv.ctrl_gbm = trainControl(method="repeatedcv",number=5,repeats = 5)
+gbm = train(x=as.matrix(sparseMatrixTrain.cv),y=y_train_cv, method = "gbm", metric = "RMSE", maximize = FALSE,distribution="laplace", trControl =cv.ctrl_gbm, tuneGrid = tuneGridGBM,verbose = FALSE)
+gbm_y_hat = predict(gbm,newdata = sparseMatrixTest.cv,raw=T)
+RMSE(gbm_y_hat,y_test_cv)
+```
+
+
+```{r}
+require(quantregForest)
+foldsTest =unlist(folds[[3]])
+sparseMatrixTrain.cv = sparseMatrixTrain[-foldsTest,]
+sparseMatrixTest.cv = sparseMatrixTrain[foldsTest,]
+y_train_cv = y_train_stack[-foldsTest]
+y_test_cv = y_train_stack[foldsTest]
+
+qrf = quantregForest(as.matrix(sparseMatrixTrain.cv),y_train_cv,mtry=60)
+qrf_y_hat_cv = predict(qrf,sparseMatrixTest.cv,type="raw")
+RMSE(qrf_y_hat_cv[,"quantile= 0.5"],y_test_cv)
+```
+
+```{r}
+# pr.out=prcomp(as.matrix(cbind(y_pred_enet_cv,y_hat_xgb_cv,y_hat_rf)) , scale=TRUE)
+# pr.out
+
+# foldsTest =unlist(folds[[4]])
+# sparseMatrixTrain.cv = sparseMatrix[-foldsTest,]
+# sparseMatrixTest.cv = sparseMatrix[foldsTest,]
+# y_train_cv = y_train[-foldsTest]
+# y_test_cv = y_train[foldsTest]
+# 
+# require("nnet")
+# train.control = trainControl(method="repeatedcv",
+#                                  number=5,
+#                                  repeats=1,
+#                                  verboseIter=FALSE)
+# param = list(size = 20, decay = 0.1, maxit = 400) # 
+# 
+# 
+#   input_layer_size <- ncol(sparseMatrixTrain.cv)
+#   hidden_layer_size_max <- param[[1]]
+#   Max_NWts <- (input_layer_size+1) * hidden_layer_size_max + (hidden_layer_size_max+1)
+#   scl <- max(y_train_cv)
+#   mod.nnet <- nnet(x = as.matrix(sparseMatrixTrain.cv), y = y_train_cv/scl, decay = param[[2]], size = param[[1]],
+#                    maxit = param[[3]], MaxNWts = Max_NWts, linout = TRUE)
+#   
+#   # Predict 
+#   y_hat_NN <- predict(mod.nnet,sparseMatrixTest.cv)*scl
+#   
+#   # Return predictions
+#   RMSE(y_hat_NN,y_test_cv)
+
+```
+
+```{r}
+
+sparseMatrixTrain.cv = sparseMatrix[1:1100,]
+sparseMatrixTest.cv = sparseMatrix[1101:1452,]
+y_train_cv = y_train[1:1100]
+y_test_cv = y_train[1101:1452]
+
+y_hat_glmnet = as.numeric(predict(model_lasso,sparseMatrixTrain.cv))
+y_hat_xgb = predict(bst,newdata = sparseMatrixTrain.cv,type = "raw")
+y_hat_gbm = predict(gbm,newdata = as.matrix(sparseMatrixTrain.cv),type = "raw")
+stack.df.train=data.frame(y_train_cv,y_hat_glmnet,y_hat_xgb,y_hat_gbm)
+
+y_hat_glmnet = as.numeric(predict(model_lasso,sparseMatrixTest.cv))
+y_hat_xgb = predict(bst,newdata = sparseMatrixTest.cv,type = "raw")
+y_hat_gbm = predict(gbm,newdata = as.matrix(sparseMatrixTest.cv),type = "raw")
+stack.df.test=data.frame(y_hat_glmnet,y_hat_xgb,y_hat_gbm)
+
+require(quantreg)
+fit = rq(y_train_cv~., data = stack.df.train)
+fitted = predict(fit,newdata = stack.df.test)
+RMSE(fitted,y_test_cv)
+
+#Fit final model
+
+y_hat_glmnet = as.numeric(predict(model_lasso,sparseMatrixTest))
+y_hat_xgb = predict(bst,newdata = sparseMatrixTest,type = "raw")
+y_hat_gbm = predict(gbm,newdata = as.matrix(sparseMatrixTest),type = "raw")
+stack.df.test.final=data.frame(y_hat_glmnet,y_hat_xgb,y_hat_gbm)
+
+fitted = predict(fit,newdata = stack.df.test.final)
+
+fitted = y_hat_xgb
+these = which((y_hat_glmnet>mean(y_hat_glmnet)-3*sd(y_hat_glmnet)) & (y_hat_glmnet<mean(y_hat_glmnet)+3*sd(y_hat_glmnet)))
+fitted[-these] = .5*y_hat_xgb[-these]+.5*y_hat_glmnet[-these]
+
+
+#test_fitted_yhat <- predict(bst,newdata = sparseMatrixTest,type = "raw")
+stack_submission <- cbind(Id=1461:2919, SalePrice = exp(y_hat_glmnet)-1)
+RMSE(y_hat_glmnet,log(xgb_submission[,"SalePrice"])+1)
+write.csv(stack_submission,file="stack_submission.csv",row.names=FALSE)
+```
+
