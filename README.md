@@ -1,3 +1,3 @@
-# Housing-Price-Prediction
+# Data Science Club
 
-This repo showcases preliminary work the DSC did on [Kaggle House Price Prediction Competition](https://www.kaggle.com/c/house-prices-advanced-regression-techniques)
+This repo is to maintain the work the [Arizona State University Data Science Club](https://asudsc.wordpress.com/) is working on.  
