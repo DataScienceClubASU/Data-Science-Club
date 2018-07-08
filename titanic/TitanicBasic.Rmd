@@ -1,0 +1,179 @@
+---
+title: "Data Science Club - Titanic"
+author: "Saar Yalov"
+date: "April 6, 2018"
+output: html_document
+---
+## This is a very brief take on the Titanic dataset.
+
+```{r setup, include=FALSE,echo=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(dplyr)
+require(randomForest)
+require(xgboost)
+require(Matrix)
+require(lattice)
+require(caret)
+```
+
+# Importing Data
+
+```{r cars}
+path = "/Users/saaryalov/Downloads/"
+train = read.csv(paste0(path,"train.csv"),stringsAsFactors = F)
+test = read.csv(paste0(path,"test.csv"),stringsAsFactors = F)
+full= bind_rows(train,test)
+str(full)
+
+```
+# Helper Function - Missing Values
+```{r}
+call.na = function(data){
+  sort(sapply(data, checkNA), decreasing=TRUE)
+}
+call.na(full)
+```
+
+
+# Feature Engineering
+```{r}
+
+# Title Feature
+full$Title = gsub('(.*, )|(\\..*)', '', full$Name) # Extrat title from name
+
+# Some "reduendent" features
+full$Title[full$Title=="Mlle"] = "Miss" 
+full$Title[full$Title=="Ms"] = "Miss"
+full$Title[full$Title=="Mme"] = "Mrs"
+
+rareNames = unique(full$Title)[!(unique(full$Title) %in% c("Master","Miss","Mr","Mrs","Dr","Rev"))]
+full$Title[full$Title %in% rareNames] = "Rare"
+
+ggplot(full[1:891,], aes(x = Title, fill = factor(Survived)))+geom_bar(stat='count', position='dodge')
+
+# Family Fetures
+full$FamilySize = full$SibSp + full$Parch +1 # Including "self"
+
+## Visualize 
+ggplot(full[1:891,], aes(x = FamilySize, fill = factor(Survived))) +
+    geom_bar(stat='count', position='dodge') +
+    scale_x_continuous(breaks=c(1:max(full$FamilySize))) + 
+    labs(x = 'Family Size')
+# On can dicretize this variable
+
+full$Name= NULL
+full$Cabin = NULL
+full$Ticket = NULL
+passengerID = full$PassengerId
+full$PassengerId = NULL
+
+
+#Impute Missing Values 
+full$Fare[idx] = mean(full$Fare[full$Pclass==cls],na.rm=T)
+miceObject <- mice(full[, !names(full) %in% c('Family','Survived')], method='rf',verbose=F)
+lattice::densityplot(miceObject,~Age) # Seems Reasonable
+miceComplete = complete(miceObject)
+
+full$Age= miceComplete$Age
+full$Fare = miceComplete$Fare
+
+full$Sex = factor(full$Sex)
+full$Embarked = factor(full$Embarked)
+full$Survived = factor(full$Survived)
+full$Pclass = factor(full$Pclass)
+
+write.csv(full,"TitanicImputed.csv",row.names=FALSE)
+```
+
+
+
+# Modeling
+We will build a model using XGBoost
+
+```{r pressure, echo=FALSE}
+# Split Data into Training and Testing
+train = full[1:891,]; train$Survived = (train$Survived==1)*1 # Needs to be either 0,1 for XGBoost
+test = full[892:1309,];test$Survived=NULL
+
+train.train = train[1:600,]
+train.test = train[601:891,]
+
+# Create Sparse Matrix
+sparseTrain = sparse.model.matrix(Survived ~ .-1, data = train)
+sparseTest = sparse.model.matrix( ~ .-1, data = test)
+
+# Create XGBoost Data Structure
+dtrain <- xgb.DMatrix(data = as.matrix(sparseTrain), label = train$Survived)
+
+# Tune Parameters
+
+cv.ctrl <- trainControl(method = "repeatedcv", 
+                        repeats = 1, # Increase to 4/5 to have a more robust response
+                        number = 4, 
+                        allowParallel=T)
+xgb.grid <- expand.grid(nrounds = 30, 
+        eta = c(.01,.1), # Step Size: Larger -> Smoother; (eta .01 is usually good)
+        max_depth = c(4,6,8), # How deep the trees are: Larger -> More Complex
+        colsample_bytree=c(0.5,1), # Control "Randomness"
+        min_child_weight = 1,
+        subsample=c(0.2,0.6,1), # Control "Randomness"
+        gamma=c(0,0.1) # Regularization
+        )
+registerDoSEQ() # In case you were working with multiple cores previously
+ xgb_tune <- train(dtrain, # XGB Data Sctructure
+             factor(train$Survived), # Label - needs to be a factor for train function
+             method="xgbTree", # xgbTree for xgboost
+             trControl=cv.ctrl, #trainControl OBject
+             tuneGrid=xgb.grid, #expand.grid object
+             metric="Accuracy", # Define Metric: RMSE, ROC...
+             verbose=T)
+
+params =list( 
+   booster = 'gbtree',
+   metric = "Accuracy",
+   objective = 'binary:logistic',
+   colsample_bytree=1,
+   eta=.01,
+   max_depth=8,
+   min_child_weight=1,
+   alpha=.5,
+   lambda=.5,
+   gamma=0.1, # less overfit
+   subsample=0.6,
+   seed=1,
+   silent=TRUE)
+
+registerDoSEQ() 
+cv = xgb.cv(params, dtrain, nrounds = 400, nfold = 4, early_stopping_rounds = 100,prediction = T,verbose =T)
+             
+# Are we over fitting?
+plot(cv$evaluation_log$train_error_mean,type="l",col ="red",ylim=c(.1,.2))
+lines(cv$evaluation_log$test_error_mean,col="blue")
+
+# Yes very...
+
+
+ bst = xgb.train(params,dtrain, nrounds =300, early_stopping_rounds =50 ,watchlist = list(train=dtrain),verbose= F)
+ xgb.importance(model=bst,feature_names = colnames(dtrain))
+
+ # Fit on data
+  y.hat.xgb = predict(bst,as.matrix(sparseTest))
+ hist(y.hat.xgb)
+ y.hat.xgb = (y.hat.xgb>.5)*1
+ 
+ 
+solution = data.frame(PassengerID = 892:1309,Survived=y.hat.xgb)
+write.csv(solution,file = "xgb.dsc.csv",row.names=F)
+#
+train$Survived = factor(train$Survived)
+
+rf = randomForest(factor(Survived)~Pclass+Sex+Age+SibSp+Parch+Fare+Embarked,data=train,type="classification"+Title+FamilySize)
+#mean(predict(rf,train.test)==train.test$Survived)
+
+toSubmit = predict(rf,test)
+
+
+solution = data.frame(PassengerID = 892:1309,Survived=toSubmit)
+write.csv(solution,file = "rf.dsc.csv",row.names=F)
+```
+
