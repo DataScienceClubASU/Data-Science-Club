@@ -1,0 +1,265 @@
+---
+title: "House Price Analysis Stacking"
+author: "Maggie & Saar"
+date: "2/13/2018"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+require(ggplot2) # for data visualization
+require(mice) # For Data imputation
+require(stringr) #extracting string patterns
+require(Matrix) # matrix transformations
+require(glmnet) # ridge, lasso & elastinet
+require(xgboost) # gbm
+require(Metrics) # rmse
+require(dplyr) # load this in last so plyr doens't overlap it
+require(caret) # one hot encoding
+require(scales) # plotting $$
+require(e1071) # skewness
+require(corrplot) # correlation plot
+require(randomForest)
+```
+
+## Get Data
+```{r}
+test = read.csv("/Users/saaryalov/Downloads/test (1).csv",stringsAsFactors = F)
+dim(test)
+train = read.csv("/Users/saaryalov/Downloads/train (2).csv",stringsAsFactors = F)
+fullImputed <- readRDS('/Users/saaryalov/Downloads/fullImputed.rds')
+fullImputed$SalePrice <- NULL
+```
+
+```{r}
+options(na.action='na.pass')
+sparseMatrix <- sparse.model.matrix( ~ ., data = fullImputed)
+train.sp <- sparseMatrix[1:1460, ]
+test.sp <- sparseMatrix[1461:2919, ]
+ 
+
+# idx.outliers <- which(train$GrLivArea > 4000)
+# y.true <- full$SalePrice[which(!1:1460 %in% idx.outliers)]
+y_train <- log(train$SalePrice)
+dtrain <- xgb.DMatrix(as.matrix(train.sp), label = y_train)
+```
+
+## Cross Validation
+Creat 5 Folds
+```{r}
+set.seed(614)
+fold <- createFolds(1:1460, 5)
+foldid <- createFolds(1:1460, 5, list = F)
+```
+
+```{r}
+glmCV <- function(train = as.matrix(train.sp), target = y_train, alpha, fold = fold){
+  prediction <- vector(length = nrow(train))
+  for (i in 1:length(fold)){
+    fold.temp <- unlist(fold[i])
+    fit.glmnet <- glmnet(x = train[-fold.temp,], y = target[-fold.temp],
+                        alpha = alpha, family = 'gaussian')
+    dev.ratio <- fit.glmnet$dev.ratio
+    prediction[fold.temp] <-predict(fit.glmnet, newx = train[fold.temp,] )[,paste('s', min(which(dev.ratio > 0.9)), sep = '')]
+  }
+  return(prediction)
+}
+pred.lasso <- glmCV(alpha = 1, fold = fold)
+pred.ridge <- glmCV(alpha = 0, fold = fold)
+RMSE(pred.lasso, y_train)
+RMSE(pred.ridge, y_train)
+```
+
+```{r, eval = FALSE}
+for (alpha in seq(0, 1, by = 0.1)){
+  pred.elnet <- glmCV(alpha = alpha, fold = fold)
+  print(paste(alpha, ' : ', RMSE(pred.elnet, y_train)))
+}
+pred.glmnet = glmCV(alpha=0.1)
+```
+
+```{r}
+randomForestCV <- function(train = as.matrix(train.sp), target = y_train, fold = fold){
+  prediction <- vector(length = nrow(train))
+  tunegrid <- expand.grid(.mtry=sqrt(ncol(train)))
+  for (k in 1:length(fold)) {
+    fold.temp <- unlist(fold[k])
+#    fit.rf <- train(x=train[-fold.temp,],y = target[-fold.temp], method="rf", metric='RMSE', tuneGrid=tunegrid)
+    fit.rf <- randomForest(x = train[-fold.temp, ], y = target[-fold.temp], ntree = 500)
+    prediction[fold.temp] <- predict(fit.rf, newdata = train[fold.temp,] )
+  }
+  return(prediction)
+}
+pred.rf <- randomForestCV(train = as.matrix(train.sp), target = y_train, fold = fold)
+RMSE(pred.rf, y_train)
+```
+
+# Fit Bart
+```{r echo=F,include=F}
+require(dbarts)
+#brt = bart(as.matrix(sparseMatrix),y_train,x.test=as.matrix(sparseMatrixTest),ntree=1500)
+
+bartCV <- function(train = as.matrix(train.sp), target = y_train, fold = fold,ntree=1500){
+  prediction <- vector(length = nrow(train))
+  tunegrid <- expand.grid(.mtry=sqrt(ncol(train)))
+  for (k in 1:length(fold)) {
+    fold.temp <- unlist(fold[k])
+    brt = bart(as.matrix(train[-fold.temp,]),target[-fold.temp],x.test=as.matrix(train[fold.temp,]),ntree=ntree)
+    prediction[fold.temp] <- brt$yhat.test.mean
+  }
+  return(prediction)
+}
+pred.bart <- bartCV(train = as.matrix(train.sp), target = y_train, fold = fold)
+RMSE(pred.bart, y_train)
+```
+
+
+```{r}
+xgb.param = list(booster="gbtree",
+              eval_metric="rmse",
+              eta=0.015625,
+              colsample_bytree = 0.4,
+              max_depth = 4,
+              min_child_weight = 4,
+              gamma = 0,
+              lambda = 1.0,
+              subsample = 0.8)
+# xgb.param2 = list(booster="gbtree",
+#               eval_metric="rmse",
+#               eta=0.005,
+#               colsample_bytree = 1,
+#               max_depth = 4,
+#               min_child_weight = 2,
+#               gamma = 0.00,
+#               lambda = 1.0,
+#               subsample = 0.2)
+xgb.param2 = list( # [1506]	train-rmse:0.062558+0.001381	test-rmse:0.126363+0.011565
+  booster = 'gbtree',
+  objective = 'reg:linear',
+  colsample_bytree=1,
+  eta=0.01,
+  max_depth=4,
+  min_child_weight=2,
+  alpha=0.3,
+  lambda=0.4,
+  gamma=0.01, # less overfit
+  subsample=0.6,
+  seed=5,
+  silent=TRUE)
+xgbCV = function(train, target, fold, param){
+  train = as.matrix(train)
+  prediction <- vector(length = nrow(train))
+  tunegrid <- expand.grid(.mtry=sqrt(ncol(train)))
+  for (k in 1:length(fold)) {
+    fold.temp <- unlist(fold[k])
+    dtrain = xgb.DMatrix(train[-fold.temp, ], label = target[-fold.temp])
+    dtest = xgb.DMatrix(train[fold.temp, ])
+    fit.xgb <- xgb.train(param, dtrain, nrounds = 1500)
+    prediction[fold.temp] <- predict(fit.xgb, newdata = dtest )
+  }
+  return(prediction)
+}
+pred.xgb = xgbCV(train = train.sp, target = y_train, fold = fold, param = xgb.param2)
+RMSE(pred.xgb, y_train)
+
+```
+```{r}
+xgb = xgb.train(xgb.param2, xgb.DMatrix(train.sp, label = y_train), nrounds = 1500)
+pred.xgb1 = predict(xgb, newdata = xgb.DMatrix(train.sp))
+RMSE(pred.xgb1, y_train)
+```
+```{r}
+xgb.imp = xgb.importance(feature_names = train.sp@Dimnames[[2]], model = xgb)
+main.feat = xgb.imp$Feature[1:10]
+main.feat
+```
+
+
+
+```{r}
+ggplot(data = data.frame(X = rep(y_train, 5), Y = c(pred.rf, pred.lasso, pred.ridge, pred.xgb,pred.bart), 
+       colour = c(rep('rf', 1460), rep('lasso', 1460), rep('ridge', 1460), rep('xgb', 1460),rep('bart', 1460))),
+       aes(x = X, y = Y-X, colour = colour)) + 
+  geom_point()+
+  geom_smooth()
+```
+Leave one fold out to train the final model
+```{r}
+testfold = unlist(fold[4])
+dtrain1 = data.frame(as.matrix(train.sp[,main.feat]), 
+                        lasso = pred.lasso, ridge = pred.ridge, rf = pred.rf, xgb = pred.xgb,bart=pred.bart)
+dtrain2 = data.frame(as.matrix(train.sp), 
+                        lasso = pred.lasso, ridge = pred.ridge, rf = pred.rf, xgb = pred.xgb,bart=pred.bart)
+dtest1 = data.frame(as.matrix(test.sp[, main.feat]))
+dtest2 = data.frame(as.matrix(test.sp))
+```
+
+```{r, eval = FALSE}
+fmodel <- glmnet(x = as.matrix(dtrain1[-testfold,]), y = y_train[-testfold], alpha = 1, family = 'gaussian')
+dev.ratio <- fmodel$dev.ratio
+pred <- predict(fmodel, newx = as.matrix(dtrain1[testfold,]) )[,paste('s', min(which(dev.ratio > 0.89)), sep = '')]
+RMSE(pred, y_train[testfold])
+```
+Fit final model for lasso and ridge
+```{r}
+# Fit LASSO
+fit.lasso <- glmnet(x = as.matrix(train.sp), y = y_train, alpha = 1, family = 'gaussian')
+test.lasso <- predict(fit.lasso, newx = as.matrix(test.sp) )[,paste('s', min(which(fit.lasso$dev.ratio > 0.9)), sep = '')]
+# Fit Ridge
+fit.ridge <- glmnet(x = as.matrix(train.sp), y = y_train, alpha = 0, family = 'gaussian')
+test.ridge <- predict(fit.lasso, newx = as.matrix(test.sp) )[,paste('s', min(which(fit.ridge$dev.ratio > 0.9)), sep = '')]
+# Fit GLMnet
+fit.glmnet <- glmnet(x = as.matrix(train.sp), y = y_train, alpha = .1, family = 'gaussian')
+test.glmnet <- predict(fit.glmnet, newx = as.matrix(test.sp) )[,paste('s', min(which(fit.ridge$dev.ratio > 0.9)), sep = '')]
+```
+Fit final model for xgb
+```{r}
+fit.xgb <- xgb.train(xgb.param2, xgb.DMatrix(train.sp, label = y_train), nrounds = 1500)
+test.xgb <- predict(fit.xgb, newdata = xgb.DMatrix(test.sp) )
+```
+Fit final model for randomForest
+```{r}
+fit.rf <- randomForest(x = as.matrix(train.sp), y = y_train, ntree = 500)
+test.sp[is.na(test.sp)] = 0
+test.rf <- predict(fit.rf, newdata = as.matrix(test.sp))
+```
+Fit BART
+```{r echo=F}
+fit.bart <- bart(x = as.matrix(train.sp), y = y_train,x.test=as.matrix(test.sp), ntree = 1500)
+test.bart <- fit.bart$yhat.test.mean
+```
+
+
+Combine dtest1 with predicted features
+```{r}
+dtest1$lasso = test.lasso
+#dtest 1
+#dtest1$glmnet = test.glmnet
+dtest1$ridge = test.ridge
+dtest1$rf = test.rf
+dtest1$xgb = test.xgb
+dtest1$bart = test.bart
+
+# dtest 2
+dtest2$lasso = test.lasso
+#dtest2$glmnet = test.glmnet
+dtest2$ridge = test.ridge
+dtest2$rf = test.rf
+dtest2$xgb = test.xgb
+dtest2$bart = test.bart
+```
+
+```{r}
+fmodel <- glmnet(x = as.matrix(dtrain1), y = y_train, alpha = 1, family = 'gaussian')
+pred <- predict(fmodel, newx = as.matrix(dtest1) )[,paste('s', min(which(fit.lasso$dev.ratio > 0.9)), sep = '')]
+#pred <- predict(fmodel, newdata = xgb.DMatrix(as.matrix(dtest2) ))
+```
+
+```{r}
+#xgb.importance( model = fmodel)
+```
+
+```{r}
+#bestScore = exp(pred)
+stack_submission <- cbind(Id=1461:2919,SalePrice=exp(pred))
+write.csv(stack_submission,file="stack_submission_2.csv",row.names=FALSE)
+```
